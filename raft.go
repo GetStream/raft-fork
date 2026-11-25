@@ -1302,13 +1302,29 @@ func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
 	}
 
 	applyBatch := func(batch []*commitTuple) {
-		select {
-		case r.fsmMutateCh <- batch:
-		case <-r.shutdownCh:
-			for _, cl := range batch {
-				if cl.future != nil {
-					cl.future.respond(ErrRaftShutdown)
+		for {
+			select {
+			case r.fsmMutateCh <- batch:
+				return
+			case c := <-r.configurationsCh:
+				// Serve configuration requests while we wait to hand the
+				// batch to the FSM. This avoids a deadlock between applies
+				// and snapshots: takeSnapshot holds the FSM snapshot and
+				// then blocks on a configurationsFuture that only the main
+				// loop can answer, while the main loop can be stuck here
+				// waiting to deliver this batch to a busy FSM goroutine.
+				// Without serving configurationsCh during this wait, neither
+				// side can make progress. See snapshot.go takeSnapshot.
+				r.mainThreadSaturation.working()
+				c.configurations = r.configurations.Clone()
+				c.respond(nil)
+			case <-r.shutdownCh:
+				for _, cl := range batch {
+					if cl.future != nil {
+						cl.future.respond(ErrRaftShutdown)
+					}
 				}
+				return
 			}
 		}
 	}
